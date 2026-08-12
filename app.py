@@ -1,12 +1,13 @@
 import streamlit as st
 import pandas as pd
+import pyodbc
 import io
-import json
 import plotly.express as px
+from datetime import datetime
 
 st.set_page_config(page_title="Monitor de Precios - Chile", layout="wide")
 
-# CSS para colores corporativos
+# --- INYECCIÓN DE CSS PARA COLORES CORPORATIVOS ---
 st.markdown("""
 <style>
     span[data-baseweb="tag"]:has(span[title*="COPEC"]) { background-color: #1f77b4 !important; color: white !important; }
@@ -18,29 +19,44 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("⛽ Monitor Dinámico de Precios de Combustible")
+st.caption("Conexión en directo vía ODBC (DBMAE_2) - Evolutivo Diario")
 
 @st.cache_data(ttl=3600)
-def cargar_datos_locales():
-    # Leer el archivo super-comprimido en lugar del ODBC
-    df = pd.read_parquet("datos_precios.parquet")
+def cargar_datos_historicos():
+    conn_str = "DSN=DBMAE_2;"
+    query = """
+        SELECT 
+            CodEs AS MAE, 
+            CopBol AS Bandera, 
+            DesProducto AS Producto, 
+            Precio, 
+            FechaAct AS Fecha
+        FROM DBMAE.Tb_EstacionesHistoryPrice
+        WHERE FechaAct >= '2017-01-01' AND Precio > 0
+    """
     
-    # Leer la hora de actualización
-    try:
-        with open("info_actualizacion.json", "r") as f:
-            info = json.load(f)
-            hora_act = info.get("hora", "Desconocida")
-    except:
-        hora_act = "Desconocida"
-        
-    return df, hora_act
+    with pyodbc.connect(conn_str) as conexion:
+        df = pd.read_sql(query, conexion)
+    
+    df['MAE_Display'] = df['MAE'].astype(str) + " (" + df['Bandera'].astype(str) + ")"
+    df['MAE_Display'] = df['MAE_Display'].astype('category')
+    df['Producto'] = df['Producto'].astype('category')
+    df['Fecha'] = pd.to_datetime(df['Fecha'])
+    df['Precio'] = pd.to_numeric(df['Precio'], errors='coerce')
+    
+    hora_actual = datetime.now().strftime("%d-%m-%Y a las %H:%M")
+    
+    return df, hora_actual
 
 try:
-    df_raw, hora_actualizacion = cargar_datos_locales()
-    st.info(f"Última actualización de precios desde la base central: **{hora_actualizacion}**")
+    with st.spinner("Cargando datos desde la base de datos..."):
+        df_raw, hora_actualizacion = cargar_datos_historicos()
+        st.info(f"Última actualización de precios desde la base central: **{hora_actualizacion}**")
 except Exception as e:
-    st.error(f"Error al leer los datos: {e}. Asegúrate de haber subido 'datos_precios.parquet'.")
+    st.error(f"Error al conectar con la base de datos: {e}")
     df_raw = pd.DataFrame(columns=['MAE_Display', 'Producto', 'Precio', 'Fecha'])
 
+# --- BARRA LATERAL (FILTROS) ---
 st.sidebar.header("Filtros del Panel")
 
 if not df_raw.empty:
@@ -56,13 +72,16 @@ if not df_raw.empty:
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("**Rango de Fechas**")
+    
     fecha_min = df_raw['Fecha'].min().date()
     fecha_max = df_raw['Fecha'].max().date()
 
     f_inicio = st.sidebar.date_input("Desde:", value=fecha_min, min_value=fecha_min, max_value=fecha_max)
     f_fin = st.sidebar.date_input("Hasta:", value=fecha_max, min_value=fecha_min, max_value=fecha_max)
+
     st.sidebar.markdown("---")
 
+    # --- FILTRADO ---
     if f_inicio <= f_fin:
         df_filtrado = df_raw[
             (df_raw['Producto'] == producto_sel) &
@@ -74,6 +93,7 @@ if not df_raw.empty:
         st.sidebar.error("La fecha 'Desde' debe ser anterior a 'Hasta'.")
         df_filtrado = pd.DataFrame()
 
+    # --- VISUALIZACIÓN ---
     if not df_filtrado.empty:
         st.subheader(f"Evolución Diaria: {producto_sel}")
         
@@ -86,24 +106,65 @@ if not df_raw.empty:
             else: mapa_colores[estacion] = '#95a5a6'
         
         fig = px.line(
-            df_filtrado, x='Fecha', y='Precio', color='MAE_Display',
-            color_discrete_map=mapa_colores, line_shape='hv'
+            df_filtrado,
+            x='Fecha',
+            y='Precio',
+            color='MAE_Display',
+            color_discrete_map=mapa_colores,
+            line_shape='hv'
         )
+        
         fig.update_xaxes(tickformat="%d-%m-%Y", title_text="")
-        fig.update_yaxes(title_text="Precio (CLP)")
+        fig.update_yaxes(title_text="Precio (CLP)", tickprefix="$", tickformat=",")
         fig.update_layout(hovermode="x unified", legend_title_text='Estaciones')
         
         st.plotly_chart(fig, use_container_width=True)
         
+        # --- PROCESAMIENTO AVANZADO PARA EXCEL MULTI-PESTAÑA ---
+        df_excel = df_filtrado.copy()
+        df_excel['Fecha_Dia'] = df_excel['Fecha'].dt.strftime('%Y-%m-%d')
+        
+        # Crear la tabla pivoteada (Fechas en filas, Estaciones en columnas)
+        df_cruzado = df_excel.pivot_table(
+            index='Fecha_Dia', 
+            columns='MAE_Display', 
+            values='Precio', 
+            aggfunc='last'
+        )
+        
+        # Rellenar precios hacia adelante (Forward Fill para dias sin publicacion)
+        df_cruzado = df_cruzado.ffill()
+        
+        columnas_estaciones = list(df_cruzado.columns)
+        
+        # Lógica de cálculo según cantidad de estaciones
+        if len(columnas_estaciones) == 2:
+            est1, est2 = columnas_estaciones[0], columnas_estaciones[1]
+            df_cruzado['Diferencia ($)'] = df_cruzado[est1] - df_cruzado[est2]
+            df_cruzado['Desviación (%)'] = ((df_cruzado[est1] - df_cruzado[est2]) / df_cruzado[est2]) * 100
+        elif len(columnas_estaciones) > 2:
+            df_cruzado['Precio Promedio ($)'] = df_cruzado[columnas_estaciones].mean(axis=1).round(1)
+            df_cruzado['Precio Mínimo ($)'] = df_cruzado[columnas_estaciones].min(axis=1)
+            df_cruzado['Precio Máximo ($)'] = df_cruzado[columnas_estaciones].max(axis=1)
+            df_cruzado['Dispersión / Brecha ($)'] = df_cruzado['Precio Máximo ($)'] - df_cruzado['Precio Mínimo ($)']
+        
+        df_cruzado = df_cruzado.reset_index()
+
+        # Generar libro Excel con 2 pestañas
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            df_filtrado.to_excel(writer, index=False, sheet_name='Precios_Diarios')
+            df_cruzado.to_excel(writer, index=False, sheet_name='Comparativa_Cruzada')
+            df_filtrado.to_excel(writer, index=False, sheet_name='Detalle_Original')
         
         st.download_button(
-            label="📥 Descargar datos filtrados a Excel",
+            label="📥 Descargar Comparativa y Desviaciones a Excel",
             data=buffer.getvalue(),
-            file_name=f"precios_diarios_{producto_sel.replace(' ', '_')}.xlsx",
+            file_name=f"comparativa_precios_{producto_sel.replace(' ', '_')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     else:
-        st.warning("Selecciona al menos un código MAE (y un rango de fechas válido).")
+        st.warning("Selecciona al menos un código MAE (y un rango de fechas válido) para visualizar los datos.")
+
+if st.sidebar.button("🔄 Forzar actualización de datos"):
+    st.cache_data.clear()
+    st.rerun()
